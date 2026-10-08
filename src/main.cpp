@@ -7,6 +7,8 @@
 #include <tdms.hpp>
 
 #include "export_range.hpp"
+#include "rolling_abs_mean.hpp"
+#include "rolling_rms.hpp"
 
 #include <charconv>
 #include <cmath>
@@ -69,6 +71,12 @@ struct SetFrameDialog {
     char stop[32] = {};
 };
 
+struct RmsDialog {
+    bool request_open = false;
+    bool invalid = false;
+    char length[32] = {};
+};
+
 struct StoredRange {
     bool set = false;
     std::string path;
@@ -83,12 +91,26 @@ struct Viewer {
     IntegerSamples integer_samples;
     ViewAction view_action = ViewAction::None;
     FrameLimits frame_limits;
+    bool plot_x_known = false;
+    double plot_x_min = 0.0;
+    double plot_x_max = 0.0;
     SetFrameDialog set_frame;
     StoredRange stored_range;
+    bool rms_on = false;
+    int rms_window = 0;
+    RmsDialog rms_dialog;
+    std::vector<double> rms_indexes;
+    std::vector<double> rms_values;
+    bool avg_abs_on = false;
+    int avg_abs_window = 0;
+    RmsDialog avg_abs_dialog;
+    std::vector<double> avg_abs_indexes;
+    std::vector<double> avg_abs_values;
 };
 
 constexpr const char* frame_range_error =
     "Start and stop must be whole numbers from 0 through the last sample, and start must not be after stop.";
+constexpr const char* rms_window_error = "Window length must be a positive whole number.";
 
 SampleKind sample_kind(const std::string& type_name) {
     if (type_name == "tdsTypeSingleFloat") {
@@ -197,14 +219,16 @@ void clear_selection(Viewer& viewer) {
     viewer.stored_range = {};
 }
 
-void load_capture(Viewer& viewer, const std::string& path) {
+bool load_capture(Viewer& viewer, const std::string& path) {
     try {
         auto loaded = std::make_unique<TDMS::file>(path);
         viewer.capture = std::move(loaded);
         clear_selection(viewer);
         viewer.error.clear();
+        return true;
     } catch (const std::exception& ex) {
         viewer.error = ex.what();
+        return false;
     }
 }
 
@@ -299,6 +323,16 @@ void expand_flat_limits(double& min_value, double& max_value) {
     }
 }
 
+int nearest_sample_index(double edge, int last) {
+    const double high = static_cast<double>(last);
+    if (edge < 0.0) {
+        edge = 0.0;
+    } else if (edge > high) {
+        edge = high;
+    }
+    return static_cast<int>(std::llround(edge));
+}
+
 template <typename T>
 bool finite_extent(const T* samples, int start, int stop, double& y_min, double& y_max) {
     bool any = false;
@@ -378,8 +412,14 @@ bool try_set_frame(Viewer& viewer) {
 
 void open_set_frame(Viewer& viewer, TDMS::object& object) {
     const int last = static_cast<int>(object.number_values() - 1);
-    std::snprintf(viewer.set_frame.start, sizeof(viewer.set_frame.start), "0");
-    std::snprintf(viewer.set_frame.stop, sizeof(viewer.set_frame.stop), "%d", last);
+    int start = 0;
+    int stop = last;
+    if (viewer.plot_x_known && std::isfinite(viewer.plot_x_min) && std::isfinite(viewer.plot_x_max)) {
+        start = nearest_sample_index(viewer.plot_x_min, last);
+        stop = nearest_sample_index(viewer.plot_x_max, last);
+    }
+    std::snprintf(viewer.set_frame.start, sizeof(viewer.set_frame.start), "%d", start);
+    std::snprintf(viewer.set_frame.stop, sizeof(viewer.set_frame.stop), "%d", stop);
     viewer.set_frame.invalid = false;
     viewer.set_frame.request_open = true;
 }
@@ -411,6 +451,149 @@ void draw_set_frame_dialog(Viewer& viewer) {
         ImGui::CloseCurrentPopup();
     }
     ImGui::EndPopup();
+}
+
+void open_rms_dialog(Viewer& viewer) {
+    if (viewer.rms_window >= 1) {
+        std::snprintf(
+            viewer.rms_dialog.length, sizeof(viewer.rms_dialog.length), "%d", viewer.rms_window);
+    } else {
+        std::snprintf(viewer.rms_dialog.length, sizeof(viewer.rms_dialog.length), "1");
+    }
+    viewer.rms_dialog.invalid = false;
+    viewer.rms_dialog.request_open = true;
+}
+
+bool accept_rms_window(Viewer& viewer) {
+    const std::optional<int> length = parse_frame_text(viewer.rms_dialog.length);
+    if (!length.has_value() || *length < 1) {
+        return false;
+    }
+    viewer.rms_window = *length;
+    viewer.rms_on = true;
+    return true;
+}
+
+void draw_rms_dialog(Viewer& viewer) {
+    if (viewer.rms_dialog.request_open) {
+        ImGui::OpenPopup("RMS");
+        viewer.rms_dialog.request_open = false;
+    }
+    if (!ImGui::BeginPopupModal("RMS", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    ImGui::InputText("Window length", viewer.rms_dialog.length, sizeof(viewer.rms_dialog.length));
+    if (viewer.rms_dialog.invalid) {
+        ImGui::TextWrapped("%s", rms_window_error);
+    }
+    if (ImGui::Button("OK")) {
+        if (accept_rms_window(viewer)) {
+            viewer.rms_dialog.invalid = false;
+            ImGui::CloseCurrentPopup();
+        } else {
+            viewer.rms_dialog.invalid = true;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) {
+        viewer.rms_dialog.invalid = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+template <typename T>
+void plot_rms_overlay(const T* samples, int count, Viewer& viewer) {
+    if (!viewer.rms_on || viewer.rms_window < 1 || samples == nullptr) {
+        return;
+    }
+    const ImPlotRect limits = ImPlot::GetPlotLimits();
+    int first = 0;
+    int last = 0;
+    if (!view_sample_bounds(limits.X.Min, limits.X.Max, count, first, last)) {
+        return;
+    }
+    rolling_rms(samples, first, last, viewer.rms_window, viewer.rms_indexes, viewer.rms_values);
+    if (viewer.rms_indexes.empty()) {
+        return;
+    }
+    ImPlot::PlotLine(
+        "RMS",
+        viewer.rms_indexes.data(),
+        viewer.rms_values.data(),
+        static_cast<int>(viewer.rms_indexes.size()));
+}
+
+void open_avg_abs_dialog(Viewer& viewer) {
+    if (viewer.avg_abs_window >= 1) {
+        std::snprintf(
+            viewer.avg_abs_dialog.length, sizeof(viewer.avg_abs_dialog.length), "%d", viewer.avg_abs_window);
+    } else {
+        std::snprintf(viewer.avg_abs_dialog.length, sizeof(viewer.avg_abs_dialog.length), "1");
+    }
+    viewer.avg_abs_dialog.invalid = false;
+    viewer.avg_abs_dialog.request_open = true;
+}
+
+bool accept_avg_abs_window(Viewer& viewer) {
+    const std::optional<int> length = parse_frame_text(viewer.avg_abs_dialog.length);
+    if (!length.has_value() || *length < 1) {
+        return false;
+    }
+    viewer.avg_abs_window = *length;
+    viewer.avg_abs_on = true;
+    return true;
+}
+
+void draw_avg_abs_dialog(Viewer& viewer) {
+    if (viewer.avg_abs_dialog.request_open) {
+        ImGui::OpenPopup("AVG(ABS(Y))");
+        viewer.avg_abs_dialog.request_open = false;
+    }
+    if (!ImGui::BeginPopupModal("AVG(ABS(Y))", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    ImGui::InputText("Window length", viewer.avg_abs_dialog.length, sizeof(viewer.avg_abs_dialog.length));
+    if (viewer.avg_abs_dialog.invalid) {
+        ImGui::TextWrapped("%s", rms_window_error);
+    }
+    if (ImGui::Button("OK")) {
+        if (accept_avg_abs_window(viewer)) {
+            viewer.avg_abs_dialog.invalid = false;
+            ImGui::CloseCurrentPopup();
+        } else {
+            viewer.avg_abs_dialog.invalid = true;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) {
+        viewer.avg_abs_dialog.invalid = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+template <typename T>
+void plot_avg_abs_overlay(const T* samples, int count, Viewer& viewer) {
+    if (!viewer.avg_abs_on || viewer.avg_abs_window < 1 || samples == nullptr) {
+        return;
+    }
+    const ImPlotRect limits = ImPlot::GetPlotLimits();
+    int first = 0;
+    int last = 0;
+    if (!view_sample_bounds(limits.X.Min, limits.X.Max, count, first, last)) {
+        return;
+    }
+    rolling_abs_mean(
+        samples, first, last, viewer.avg_abs_window, viewer.avg_abs_indexes, viewer.avg_abs_values);
+    if (viewer.avg_abs_indexes.empty()) {
+        return;
+    }
+    ImPlot::PlotLine(
+        "AVG(ABS(Y))",
+        viewer.avg_abs_indexes.data(),
+        viewer.avg_abs_values.data(),
+        static_cast<int>(viewer.avg_abs_indexes.size()));
 }
 
 void draw_plot(TDMS::object& object, Viewer& viewer) {
@@ -464,16 +647,32 @@ void draw_plot(TDMS::object& object, Viewer& viewer) {
         }
     }
     if (kind == SampleKind::Float) {
-        ImPlot::PlotLine(path.c_str(), static_cast<const float*>(object.data()), plot_count);
+        const auto* samples = static_cast<const float*>(object.data());
+        ImPlot::PlotLine(path.c_str(), samples, plot_count);
+        plot_rms_overlay(samples, plot_count, viewer);
+        plot_avg_abs_overlay(samples, plot_count, viewer);
     } else if (kind == SampleKind::Double) {
-        ImPlot::PlotLine(path.c_str(), static_cast<const double*>(object.data()), plot_count);
+        const auto* samples = static_cast<const double*>(object.data());
+        ImPlot::PlotLine(path.c_str(), samples, plot_count);
+        plot_rms_overlay(samples, plot_count, viewer);
+        plot_avg_abs_overlay(samples, plot_count, viewer);
     } else if (is_integer_kind(kind)) {
         fill_integer_samples(object, kind, viewer.integer_samples);
         if (viewer.integer_samples.values.size() == count) {
             ImPlot::PlotLine(path.c_str(), viewer.integer_samples.values.data(), plot_count);
+            plot_rms_overlay(viewer.integer_samples.values.data(), plot_count, viewer);
+            plot_avg_abs_overlay(viewer.integer_samples.values.data(), plot_count, viewer);
         }
     }
     ImPlot::EndPlot();
+    if (ImPlotPlot* plot = ImPlot::GetPlot("##channel")) {
+        if (plot->Initialized) {
+            const ImPlotRange& range = plot->Axes[ImAxis_X1].Range;
+            viewer.plot_x_min = range.Min;
+            viewer.plot_x_max = range.Max;
+            viewer.plot_x_known = true;
+        }
+    }
     viewer.view_action = ViewAction::None;
 }
 
@@ -546,8 +745,9 @@ void draw_ui(Viewer& viewer, GLFWwindow* window) {
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Open")) {
                 const std::optional<std::string> path = choose_tdms_path(window);
-                if (path.has_value()) {
-                    load_capture(viewer, *path);
+                if (path.has_value() && load_capture(viewer, *path)) {
+                    const std::string title = "tdms_viewer - " + *path;
+                    glfwSetWindowTitle(window, title.c_str());
                 }
             }
             if (ImGui::MenuItem("Export Range", nullptr, false, can_export)) {
@@ -573,9 +773,25 @@ void draw_ui(Viewer& viewer, GLFWwindow* window) {
             if (ImGui::MenuItem("Set Range", nullptr, false, plotted_channel)) {
                 open_set_frame(viewer, *plotted);
             }
+            if (ImGui::MenuItem("RMS", nullptr, viewer.rms_on, plotted_channel)) {
+                if (viewer.rms_on) {
+                    viewer.rms_on = false;
+                } else {
+                    open_rms_dialog(viewer);
+                }
+            }
+            if (ImGui::MenuItem("AVG(ABS(Y))", nullptr, viewer.avg_abs_on, plotted_channel)) {
+                if (viewer.avg_abs_on) {
+                    viewer.avg_abs_on = false;
+                } else {
+                    open_avg_abs_dialog(viewer);
+                }
+            }
             ImGui::EndMenu();
         }
         draw_set_frame_dialog(viewer);
+        draw_rms_dialog(viewer);
+        draw_avg_abs_dialog(viewer);
         ImGui::EndMainMenuBar();
     }
 

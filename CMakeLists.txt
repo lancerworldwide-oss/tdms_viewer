@@ -88,6 +88,7 @@ target_include_directories(tdmspp PUBLIC ${tdmspp_SOURCE_DIR}/src)
 add_executable(tdms_viewer
     src/main.cpp
     src/export_range.cpp
+    src/rolling_rms.cpp
 )
 
 target_link_libraries(tdms_viewer PRIVATE implot tdmspp comdlg32)
@@ -119,6 +120,27 @@ add_executable(tdms_export_range
 target_include_directories(tdms_export_range PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(tdms_export_range PRIVATE tdmspp)
 target_compile_options(tdms_export_range PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
+add_executable(tdms_rolling_rms
+    tests/rolling_rms.cpp
+    src/rolling_rms.cpp
+)
+target_include_directories(tdms_rolling_rms PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(tdms_rolling_rms PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
+add_executable(tdms_rolling_abs_mean
+    tests/rolling_abs_mean.cpp
+)
+target_include_directories(tdms_rolling_abs_mean PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(tdms_rolling_abs_mean PRIVATE
     -Wall
     -Wextra
     -Wpedantic
