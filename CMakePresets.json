@@ -1,0 +1,100 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "mingw-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "description": "MSYS2 UCRT64 MinGW (g++ / ninja)",
+      "binaryDir": "${sourceDir}/.build/${presetName}",
+      "environment": {
+        "PATH": "C:/msys64/ucrt64/bin;$penv{PATH}",
+        "CMAKE_SH": "CMAKE_SH-NOTFOUND"
+      },
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "C:/msys64/ucrt64/bin/g++.exe",
+        "CMAKE_MAKE_PROGRAM": "C:/msys64/ucrt64/bin/ninja.exe",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "mingw",
+      "displayName": "MinGW UCRT64 Debug",
+      "inherits": "mingw-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "mingw-release",
+      "displayName": "MinGW UCRT64 Release",
+      "inherits": "mingw-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "mingw-wsl-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "description": "WSL MinGW-w64 x86_64 posix (g++ / ninja)",
+      "binaryDir": "${sourceDir}/.build/${presetName}",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "cacheVariables": {
+        "CMAKE_SYSTEM_NAME": "Windows",
+        "CMAKE_C_COMPILER": "/usr/bin/x86_64-w64-mingw32-gcc-posix",
+        "CMAKE_CXX_COMPILER": "/usr/bin/x86_64-w64-mingw32-g++-posix",
+        "CMAKE_RC_COMPILER": "/usr/bin/x86_64-w64-mingw32-windres",
+        "CMAKE_MAKE_PROGRAM": "/usr/bin/ninja",
+        "CMAKE_FIND_ROOT_PATH": "/usr/x86_64-w64-mingw32",
+        "CMAKE_FIND_ROOT_PATH_MODE_PROGRAM": "NEVER",
+        "CMAKE_FIND_ROOT_PATH_MODE_LIBRARY": "ONLY",
+        "CMAKE_FIND_ROOT_PATH_MODE_INCLUDE": "ONLY",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "mingw-wsl",
+      "displayName": "WSL MinGW-w64 Debug",
+      "inherits": "mingw-wsl-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "mingw-wsl-release",
+      "displayName": "WSL MinGW-w64 Release",
+      "inherits": "mingw-wsl-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "mingw",
+      "configurePreset": "mingw"
+    },
+    {
+      "name": "mingw-release",
+      "configurePreset": "mingw-release"
+    },
+    {
+      "name": "mingw-wsl",
+      "configurePreset": "mingw-wsl"
+    },
+    {
+      "name": "mingw-wsl-release",
+      "configurePreset": "mingw-wsl-release"
+    }
+  ]
+}

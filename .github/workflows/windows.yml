@@ -1,0 +1,55 @@
+name: Windows
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Keep patch line endings
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v5
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          path-type: inherit
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-cmake
+
+      - name: Configure
+        run: cmake --preset mingw-release
+
+      - name: Build
+        run: cmake --build --preset mingw-release
+
+      - name: Check runtime
+        shell: pwsh
+        run: |
+          $imports = objdump -p .build/mingw-release/tdms_viewer.exe | Select-String -Pattern 'libstdc\+\+-6\.dll|libgcc_s_seh-1\.dll|libwinpthread-1\.dll'
+          if ($imports) {
+            $imports
+            exit 1
+          }
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=.build/mingw-release/tdms_viewer.exe
+          if gh release view continuous >/dev/null 2>&1; then
+            gh release upload continuous "$exe" --clobber
+          else
+            gh release create continuous "$exe" --title "tdms_viewer" --notes "Current build from main."
+          fi

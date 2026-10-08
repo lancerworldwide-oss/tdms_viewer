@@ -1,0 +1,64 @@
+diff --git a/src/tdms_file.cpp b/src/tdms_file.cpp
+index 4c10d92..6c4efe2 100644
+--- a/src/tdms_file.cpp
++++ b/src/tdms_file.cpp
+@@ -14,7 +14,7 @@ namespace TDMS
+ file::file(const std::string& filename)
+ {
+     // Read file into memory
+-    FILE* f = fopen(filename.c_str(), "r");
++    FILE* f = fopen(filename.c_str(), "rb");
+     if(!f)
+     {
+         throw std::runtime_error("File \"" + filename + "\" could not be opened");
+diff --git a/src/tdms_impl.hpp b/src/tdms_impl.hpp
+index 4331635..2e2b6d3 100644
+--- a/src/tdms_impl.hpp
++++ b/src/tdms_impl.hpp
+@@ -44,6 +44,7 @@ private:
+             segment* previous_segment);
+     void _parse_raw_data();
+     void _calculate_chunks();
++    void _clone_ordered_objects(const segment* previous_segment);
+ 
+     size_t _offset;
+     size_t _chunk_count;
+diff --git a/src/tdms_segment.cpp b/src/tdms_segment.cpp
+index f86b2d4..61520af 100644
+--- a/src/tdms_segment.cpp
++++ b/src/tdms_segment.cpp
+@@ -137,7 +137,7 @@ void segment::_parse_metadata(const unsigned char* data,
+         if(previous_segment == nullptr)
+             throw std::runtime_error("kTocMetaData is set for segment, but"
+                     "there is no previous segment.");
+-        this->_ordered_objects = previous_segment->_ordered_objects;
++        _clone_ordered_objects(previous_segment);
+         _calculate_chunks();
+         return;
+     }
+@@ -150,7 +150,7 @@ void segment::_parse_metadata(const unsigned char* data,
+         if(previous_segment == nullptr)
+             throw std::runtime_error("kTocNewObjList is set for segment, but"
+                     "there is no previous segment.");
+-        this->_ordered_objects = previous_segment->_ordered_objects;
++        _clone_ordered_objects(previous_segment);
+     }
+ 
+     // Read number of metadata objects
+@@ -273,6 +273,16 @@ void segment::_calculate_chunks()
+     }
+ }
+ 
++void segment::_clone_ordered_objects(const segment* previous_segment)
++{
++    _ordered_objects.clear();
++    _ordered_objects.reserve(previous_segment->_ordered_objects.size());
++    for(const auto& existing : previous_segment->_ordered_objects)
++    {
++        _ordered_objects.push_back(std::make_shared<segment::object>(*existing));
++    }
++}
++
+ void segment::_parse_raw_data()
+ {
+     if(!this->_toc["kTocRawData"])
