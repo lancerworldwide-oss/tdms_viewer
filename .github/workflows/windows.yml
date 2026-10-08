@@ -21,10 +21,16 @@ jobs:
         with:
           msystem: UCRT64
           path-type: inherit
+          release: false
+          update: true
           install: >-
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-cmake
+
+      - name: Add UCRT64 to PATH
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_PATH -Value 'C:\msys64\ucrt64\bin'
 
       - name: Configure
         run: cmake --preset mingw-release
