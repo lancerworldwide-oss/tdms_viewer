@@ -89,6 +89,7 @@ add_executable(tdms_viewer
     src/main.cpp
     src/export_range.cpp
     src/rolling_rms.cpp
+    src/duration.cpp
 )
 
 target_link_libraries(tdms_viewer PRIVATE implot tdmspp comdlg32)
@@ -141,6 +142,17 @@ add_executable(tdms_rolling_abs_mean
 )
 target_include_directories(tdms_rolling_abs_mean PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_options(tdms_rolling_abs_mean PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
+add_executable(tdms_duration
+    tests/duration.cpp
+    src/duration.cpp
+)
+target_include_directories(tdms_duration PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(tdms_duration PRIVATE
     -Wall
     -Wextra
     -Wpedantic

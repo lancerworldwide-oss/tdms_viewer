@@ -6,6 +6,7 @@
 #include <implot_internal.h>
 #include <tdms.hpp>
 
+#include "duration.hpp"
 #include "export_range.hpp"
 #include "rolling_abs_mean.hpp"
 #include "rolling_rms.hpp"
@@ -106,6 +107,10 @@ struct Viewer {
     RmsDialog avg_abs_dialog;
     std::vector<double> avg_abs_indexes;
     std::vector<double> avg_abs_values;
+    bool duration_on = false;
+    std::optional<std::string> duration_path;
+    std::optional<int> duration_start;
+    std::optional<int> duration_end;
 };
 
 constexpr const char* frame_range_error =
@@ -212,11 +217,18 @@ void fill_integer_samples(TDMS::object& object, SampleKind kind, IntegerSamples&
     }
 }
 
+void clear_duration_markers(Viewer& viewer) {
+    viewer.duration_path.reset();
+    viewer.duration_start.reset();
+    viewer.duration_end.reset();
+}
+
 void clear_selection(Viewer& viewer) {
     viewer.selected_path.reset();
     viewer.integer_samples.path.reset();
     viewer.integer_samples.values.clear();
     viewer.stored_range = {};
+    clear_duration_markers(viewer);
 }
 
 bool load_capture(Viewer& viewer, const std::string& path) {
@@ -596,6 +608,208 @@ void plot_avg_abs_overlay(const T* samples, int count, Viewer& viewer) {
         static_cast<int>(viewer.avg_abs_indexes.size()));
 }
 
+std::optional<double> waveform_increment(TDMS::object& object) {
+    const auto properties = object.get_properties();
+    const auto found = properties.find(std::string("wf_increment"));
+    if (found == properties.end() || found->second == nullptr || found->second->value == nullptr) {
+        return std::nullopt;
+    }
+    const TDMS::object::property& property = *found->second;
+    double value = 0.0;
+    if (property.data_type.name == "tdsTypeDoubleFloat" && property.data_type.ctype_length == sizeof(double)) {
+        value = *static_cast<const double*>(property.value);
+    } else if (property.data_type.name == "tdsTypeSingleFloat" &&
+               property.data_type.ctype_length == sizeof(float)) {
+        value = static_cast<double>(*static_cast<const float*>(property.value));
+    } else {
+        return std::nullopt;
+    }
+    if (!std::isfinite(value) || !(value > 0.0)) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+std::optional<double> plotted_sample(TDMS::object& object, Viewer& viewer, int index) {
+    if (index < 0) {
+        return std::nullopt;
+    }
+    const std::size_t count = object.number_values();
+    if (static_cast<std::size_t>(index) >= count || object.data() == nullptr) {
+        return std::nullopt;
+    }
+    const SampleKind kind = sample_kind(object.data_type());
+    double value = 0.0;
+    if (kind == SampleKind::Float) {
+        value = static_cast<double>(static_cast<const float*>(object.data())[index]);
+    } else if (kind == SampleKind::Double) {
+        value = static_cast<const double*>(object.data())[index];
+    } else if (is_integer_kind(kind)) {
+        fill_integer_samples(object, kind, viewer.integer_samples);
+        if (viewer.integer_samples.values.size() != count) {
+            return std::nullopt;
+        }
+        value = viewer.integer_samples.values[static_cast<std::size_t>(index)];
+    } else {
+        return std::nullopt;
+    }
+    if (!std::isfinite(value)) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+template <typename T>
+int closest_sample(const T* samples, int count, double mouse_x, const ImVec2& mouse_px) {
+    if (samples == nullptr || count <= 0) {
+        return -1;
+    }
+    const int last = count - 1;
+    const int seed = nearest_sample_index(mouse_x, last);
+    const ImPlotRect limits = ImPlot::GetPlotLimits();
+    const double x_span = limits.X.Max - limits.X.Min;
+    const float plot_width = ImPlot::GetPlotSize().x;
+    const double pixels_per_index =
+        plot_width > 0.0f && x_span != 0.0 ? static_cast<double>(plot_width) / std::fabs(x_span) : 0.0;
+
+    int best = -1;
+    double best_dist = 0.0;
+    for (int radius = 0; radius <= last; ++radius) {
+        if (best >= 0 && pixels_per_index > 0.0) {
+            const double index_gap = static_cast<double>(radius) - 0.5;
+            if (index_gap > 0.0) {
+                const double x_dist = index_gap * pixels_per_index;
+                if (x_dist * x_dist >= best_dist) {
+                    break;
+                }
+            }
+        }
+        const int candidates[2] = {seed - radius, seed + radius};
+        const int candidate_count = radius == 0 ? 1 : 2;
+        for (int n = 0; n < candidate_count; ++n) {
+            const int index = candidates[n];
+            if (index < 0 || index > last) {
+                continue;
+            }
+            const double y = static_cast<double>(samples[index]);
+            if (!std::isfinite(y)) {
+                continue;
+            }
+            const ImVec2 sample_px = ImPlot::PlotToPixels(static_cast<double>(index), y);
+            const double dx = static_cast<double>(sample_px.x - mouse_px.x);
+            const double dy = static_cast<double>(sample_px.y - mouse_px.y);
+            const double dist = dx * dx + dy * dy;
+            if (best < 0 || dist < best_dist) {
+                best = index;
+                best_dist = dist;
+            }
+        }
+    }
+    return best;
+}
+
+int closest_clicked_sample(TDMS::object& object, Viewer& viewer, const ImPlotPoint& mouse, const ImVec2& mouse_px) {
+    const int count = static_cast<int>(object.number_values());
+    const SampleKind kind = sample_kind(object.data_type());
+    if (kind == SampleKind::Float) {
+        return closest_sample(static_cast<const float*>(object.data()), count, mouse.x, mouse_px);
+    }
+    if (kind == SampleKind::Double) {
+        return closest_sample(static_cast<const double*>(object.data()), count, mouse.x, mouse_px);
+    }
+    if (!is_integer_kind(kind)) {
+        return -1;
+    }
+    fill_integer_samples(object, kind, viewer.integer_samples);
+    if (static_cast<int>(viewer.integer_samples.values.size()) != count) {
+        return -1;
+    }
+    return closest_sample(viewer.integer_samples.values.data(), count, mouse.x, mouse_px);
+}
+
+void place_duration_marker(Viewer& viewer, const std::string& path, int index) {
+    if (!viewer.duration_path.has_value() || *viewer.duration_path != path || !viewer.duration_start.has_value()) {
+        viewer.duration_path = path;
+        viewer.duration_start = index;
+        viewer.duration_end.reset();
+        return;
+    }
+    if (!viewer.duration_end.has_value()) {
+        viewer.duration_end = index;
+    }
+}
+
+void draw_duration(TDMS::object& object, Viewer& viewer) {
+    if (!viewer.duration_on || !viewer.duration_path.has_value() || *viewer.duration_path != object.get_path() ||
+        !viewer.duration_start.has_value()) {
+        return;
+    }
+    const std::optional<double> increment = waveform_increment(object);
+    const std::optional<double> start_y = plotted_sample(object, viewer, *viewer.duration_start);
+    if (!increment.has_value() || !start_y.has_value()) {
+        return;
+    }
+    double xs[2] = {static_cast<double>(*viewer.duration_start), 0.0};
+    double ys[2] = {*start_y, 0.0};
+    int point_count = 1;
+    if (viewer.duration_end.has_value()) {
+        const std::optional<double> end_y = plotted_sample(object, viewer, *viewer.duration_end);
+        if (!end_y.has_value()) {
+            return;
+        }
+        xs[1] = static_cast<double>(*viewer.duration_end);
+        ys[1] = *end_y;
+        point_count = 2;
+    }
+    ImPlotSpec spec;
+    spec.Marker = ImPlotMarker_Circle;
+    spec.Flags = ImPlotItemFlags_NoFit;
+    if (point_count == 1) {
+        spec.Flags |= ImPlotItemFlags_NoLegend;
+        ImPlot::PlotScatter("##duration_start", xs, ys, 1, spec);
+        return;
+    }
+    ImPlot::PlotLine("Duration", xs, ys, point_count, spec);
+    const std::string label =
+        format_duration(duration_seconds(*viewer.duration_start, *viewer.duration_end, *increment));
+    const ImVec4 text_color = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    ImPlot::Annotation(
+        (xs[0] + xs[1]) * 0.5,
+        (ys[0] + ys[1]) * 0.5,
+        text_color,
+        ImVec2(0.0f, 0.0f),
+        true,
+        "%s",
+        label.c_str());
+}
+
+void handle_duration_click(TDMS::object& object, Viewer& viewer) {
+    if (!viewer.duration_on || !waveform_increment(object).has_value()) {
+        return;
+    }
+    const ImGuiIO& io = ImGui::GetIO();
+    if (!io.MouseReleased[ImGuiMouseButton_Left]) {
+        return;
+    }
+    const ImPlotPlot& plot = *GImPlot->CurrentPlot;
+    const float threshold = io.MouseDragThreshold;
+    const bool within_drag = io.MouseDragMaxDistanceSqr[ImGuiMouseButton_Left] < threshold * threshold;
+    const bool release_inside = plot.Hovered && plot.PlotRect.Contains(io.MousePos);
+    const bool press_inside = plot.PlotRect.Contains(io.MouseClickedPos[ImGuiMouseButton_Left]);
+    if (!within_drag || !release_inside || !press_inside) {
+        return;
+    }
+    const ImPlotPoint mouse = ImPlot::GetPlotMousePos();
+    if (!std::isfinite(mouse.x) || !std::isfinite(mouse.y)) {
+        return;
+    }
+    const int index = closest_clicked_sample(object, viewer, mouse, io.MousePos);
+    if (index < 0) {
+        return;
+    }
+    place_duration_marker(viewer, object.get_path(), index);
+}
+
 void draw_plot(TDMS::object& object, Viewer& viewer) {
     const std::string path = object.get_path();
     const std::string type_name = object.data_type();
@@ -664,6 +878,8 @@ void draw_plot(TDMS::object& object, Viewer& viewer) {
             plot_avg_abs_overlay(viewer.integer_samples.values.data(), plot_count, viewer);
         }
     }
+    handle_duration_click(object, viewer);
+    draw_duration(object, viewer);
     ImPlot::EndPlot();
     if (ImPlotPlot* plot = ImPlot::GetPlot("##channel")) {
         if (plot->Initialized) {
@@ -786,6 +1002,14 @@ void draw_ui(Viewer& viewer, GLFWwindow* window) {
                 } else {
                     open_avg_abs_dialog(viewer);
                 }
+            }
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Tools")) {
+            const bool can_measure = plotted_channel && waveform_increment(*plotted).has_value();
+            if (ImGui::MenuItem("Duration", nullptr, viewer.duration_on, can_measure || viewer.duration_on)) {
+                viewer.duration_on = !viewer.duration_on;
+                clear_duration_markers(viewer);
             }
             ImGui::EndMenu();
         }
