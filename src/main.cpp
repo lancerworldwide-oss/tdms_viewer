@@ -8,6 +8,9 @@
 
 #include "duration.hpp"
 #include "export_range.hpp"
+#include "fft.hpp"
+#include "frequency.hpp"
+#include "iir_filter.hpp"
 #include "rolling_abs_mean.hpp"
 #include "rolling_rms.hpp"
 
@@ -23,6 +26,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #define WIN32_LEAN_AND_MEAN
@@ -85,6 +89,48 @@ struct StoredRange {
     int stop = 0;
 };
 
+struct FrequencyDialog {
+    bool request_open = false;
+    bool fit = false;
+    double hertz = 0.0;
+};
+
+constexpr int kIirCount = 16;
+
+struct IirOverlay {
+    bool on = false;
+    int order = 4;
+    double cutoff = 1.0;
+    double center = 1.0;
+    double width = 1.0;
+    double q = 1.0 / std::sqrt(2.0);
+    double ripple = 1.0;
+    std::vector<double> values;
+    bool cache_set = false;
+    bool cache_failed = false;
+    std::string cache_path;
+    std::size_t cache_count = 0;
+    double cache_dt = 0.0;
+    int cache_order = 0;
+    double cache_cutoff = 0.0;
+    double cache_center = 0.0;
+    double cache_width = 0.0;
+    double cache_q = 0.0;
+    double cache_ripple = 0.0;
+};
+
+struct IirDialog {
+    bool request_open = false;
+    bool invalid = false;
+    int index = -1;
+    char order[32] = {};
+    char cutoff[64] = {};
+    char center[64] = {};
+    char width[64] = {};
+    char q[64] = {};
+    char ripple[64] = {};
+};
+
 struct Viewer {
     std::unique_ptr<TDMS::file> capture;
     std::optional<std::string> selected_path;
@@ -107,15 +153,26 @@ struct Viewer {
     RmsDialog avg_abs_dialog;
     std::vector<double> avg_abs_indexes;
     std::vector<double> avg_abs_values;
+    bool fft_on = false;
+    int fft_count = 0;
+    RmsDialog fft_dialog;
+    bool fft_hist_known = false;
+    std::string fft_hist_path;
+    int fft_hist_first = 0;
+    int fft_hist_last = 0;
     bool duration_on = false;
     std::optional<std::string> duration_path;
     std::optional<int> duration_start;
     std::optional<int> duration_end;
+    FrequencyDialog frequency_dialog;
+    IirOverlay iir[kIirCount];
+    IirDialog iir_dialog;
 };
 
 constexpr const char* frame_range_error =
     "Start and stop must be whole numbers from 0 through the last sample, and start must not be after stop.";
 constexpr const char* rms_window_error = "Window length must be a positive whole number.";
+constexpr const char* fft_count_error = "Component count must be a positive whole number.";
 
 SampleKind sample_kind(const std::string& type_name) {
     if (type_name == "tdsTypeSingleFloat") {
@@ -223,12 +280,23 @@ void clear_duration_markers(Viewer& viewer) {
     viewer.duration_end.reset();
 }
 
+void clear_iir_caches(Viewer& viewer) {
+    for (IirOverlay& overlay : viewer.iir) {
+        overlay.values.clear();
+        overlay.cache_set = false;
+        overlay.cache_failed = false;
+        overlay.cache_path.clear();
+        overlay.cache_count = 0;
+    }
+}
+
 void clear_selection(Viewer& viewer) {
     viewer.selected_path.reset();
     viewer.integer_samples.path.reset();
     viewer.integer_samples.values.clear();
     viewer.stored_range = {};
     clear_duration_markers(viewer);
+    clear_iir_caches(viewer);
 }
 
 bool load_capture(Viewer& viewer, const std::string& path) {
@@ -608,6 +676,54 @@ void plot_avg_abs_overlay(const T* samples, int count, Viewer& viewer) {
         static_cast<int>(viewer.avg_abs_indexes.size()));
 }
 
+void open_fft_dialog(Viewer& viewer) {
+    if (viewer.fft_count >= 1) {
+        std::snprintf(viewer.fft_dialog.length, sizeof(viewer.fft_dialog.length), "%d", viewer.fft_count);
+    } else {
+        std::snprintf(viewer.fft_dialog.length, sizeof(viewer.fft_dialog.length), "1");
+    }
+    viewer.fft_dialog.invalid = false;
+    viewer.fft_dialog.request_open = true;
+}
+
+bool accept_fft_count(Viewer& viewer) {
+    const std::optional<int> count = parse_frame_text(viewer.fft_dialog.length);
+    if (!count.has_value() || *count < 1) {
+        return false;
+    }
+    viewer.fft_count = *count;
+    viewer.fft_on = true;
+    return true;
+}
+
+void draw_fft_dialog(Viewer& viewer) {
+    if (viewer.fft_dialog.request_open) {
+        ImGui::OpenPopup("FFT");
+        viewer.fft_dialog.request_open = false;
+    }
+    if (!ImGui::BeginPopupModal("FFT", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    ImGui::InputText("Component count", viewer.fft_dialog.length, sizeof(viewer.fft_dialog.length));
+    if (viewer.fft_dialog.invalid) {
+        ImGui::TextWrapped("%s", fft_count_error);
+    }
+    if (ImGui::Button("OK")) {
+        if (accept_fft_count(viewer)) {
+            viewer.fft_dialog.invalid = false;
+            ImGui::CloseCurrentPopup();
+        } else {
+            viewer.fft_dialog.invalid = true;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) {
+        viewer.fft_dialog.invalid = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 std::optional<double> waveform_increment(TDMS::object& object) {
     const auto properties = object.get_properties();
     const auto found = properties.find(std::string("wf_increment"));
@@ -810,6 +926,368 @@ void handle_duration_click(TDMS::object& object, Viewer& viewer) {
     place_duration_marker(viewer, object.get_path(), index);
 }
 
+struct IirSpec {
+    const char* title;
+    IirFamily family;
+    IirResponse response;
+    const char* error;
+};
+
+constexpr IirSpec kIirSpecs[kIirCount] = {
+    {"Butterworth Lowpass",
+     IirFamily::Butterworth,
+     IirResponse::LowPass,
+     "Order must be a whole number from 1 through 10, and cutoff must be greater than 0 and below the Nyquist frequency."},
+    {"Butterworth Highpass",
+     IirFamily::Butterworth,
+     IirResponse::HighPass,
+     "Order must be a whole number from 1 through 10, and cutoff must be greater than 0 and below the Nyquist frequency."},
+    {"Butterworth Bandpass",
+     IirFamily::Butterworth,
+     IirResponse::BandPass,
+     "Order must be a whole number from 1 through 10. Center and width must be greater than 0, and the band from center minus half the width through center plus half the width must lie inside 0 and the Nyquist frequency."},
+    {"Butterworth Bandstop",
+     IirFamily::Butterworth,
+     IirResponse::BandStop,
+     "Order must be a whole number from 1 through 10. Center and width must be greater than 0, and the band from center minus half the width through center plus half the width must lie inside 0 and the Nyquist frequency."},
+    {"Chebyshev I Lowpass",
+     IirFamily::ChebyshevI,
+     IirResponse::LowPass,
+     "Order must be a whole number from 1 through 10, cutoff must be greater than 0 and below the Nyquist frequency, and passband ripple must be greater than 0."},
+    {"Chebyshev I Highpass",
+     IirFamily::ChebyshevI,
+     IirResponse::HighPass,
+     "Order must be a whole number from 1 through 10, cutoff must be greater than 0 and below the Nyquist frequency, and passband ripple must be greater than 0."},
+    {"Chebyshev I Bandpass",
+     IirFamily::ChebyshevI,
+     IirResponse::BandPass,
+     "Order must be a whole number from 1 through 10. Center and width must be greater than 0, the band from center minus half the width through center plus half the width must lie inside 0 and the Nyquist frequency, and passband ripple must be greater than 0."},
+    {"Chebyshev I Bandstop",
+     IirFamily::ChebyshevI,
+     IirResponse::BandStop,
+     "Order must be a whole number from 1 through 10. Center and width must be greater than 0, the band from center minus half the width through center plus half the width must lie inside 0 and the Nyquist frequency, and passband ripple must be greater than 0."},
+    {"Chebyshev II Lowpass",
+     IirFamily::ChebyshevII,
+     IirResponse::LowPass,
+     "Order must be a whole number from 1 through 10, cutoff must be greater than 0 and below the Nyquist frequency, and stopband ripple must be greater than 0."},
+    {"Chebyshev II Highpass",
+     IirFamily::ChebyshevII,
+     IirResponse::HighPass,
+     "Order must be a whole number from 1 through 10, cutoff must be greater than 0 and below the Nyquist frequency, and stopband ripple must be greater than 0."},
+    {"Chebyshev II Bandpass",
+     IirFamily::ChebyshevII,
+     IirResponse::BandPass,
+     "Order must be a whole number from 1 through 10. Center and width must be greater than 0, the band from center minus half the width through center plus half the width must lie inside 0 and the Nyquist frequency, and stopband ripple must be greater than 0."},
+    {"Chebyshev II Bandstop",
+     IirFamily::ChebyshevII,
+     IirResponse::BandStop,
+     "Order must be a whole number from 1 through 10. Center and width must be greater than 0, the band from center minus half the width through center plus half the width must lie inside 0 and the Nyquist frequency, and stopband ripple must be greater than 0."},
+    {"RBJ Lowpass",
+     IirFamily::Rbj,
+     IirResponse::LowPass,
+     "Cutoff must be greater than 0 and below the Nyquist frequency, and Q must be greater than 0."},
+    {"RBJ Highpass",
+     IirFamily::Rbj,
+     IirResponse::HighPass,
+     "Cutoff must be greater than 0 and below the Nyquist frequency, and Q must be greater than 0."},
+    {"RBJ Bandpass",
+     IirFamily::Rbj,
+     IirResponse::BandPass,
+     "Center and width must be greater than 0, and the band from center minus half the width through center plus half the width must lie inside 0 and the Nyquist frequency."},
+    {"RBJ Bandstop",
+     IirFamily::Rbj,
+     IirResponse::BandStop,
+     "Center and width must be greater than 0, and the band from center minus half the width through center plus half the width must lie inside 0 and the Nyquist frequency."},
+};
+
+bool iir_response_is_band(IirResponse response) {
+    return response == IirResponse::BandPass || response == IirResponse::BandStop;
+}
+
+void format_iir_number(char* text, std::size_t size, double value) {
+    if (size == 0) {
+        return;
+    }
+    const std::to_chars_result result = std::to_chars(
+        text,
+        text + size - 1,
+        value,
+        std::chars_format::general,
+        std::numeric_limits<double>::max_digits10);
+    if (result.ec == std::errc()) {
+        *result.ptr = '\0';
+        return;
+    }
+    text[0] = '\0';
+}
+
+std::optional<double> parse_iir_number(const char* text) {
+    std::string_view view(text);
+    while (!view.empty() && (view.front() == ' ' || view.front() == '\t')) {
+        view.remove_prefix(1);
+    }
+    while (!view.empty() && (view.back() == ' ' || view.back() == '\t')) {
+        view.remove_suffix(1);
+    }
+    if (view.empty()) {
+        return std::nullopt;
+    }
+    double value = 0.0;
+    const char* const begin = view.data();
+    const char* const end = begin + view.size();
+    const std::from_chars_result result = std::from_chars(begin, end, value);
+    if (result.ec != std::errc() || result.ptr != end || !std::isfinite(value)) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+void open_iir_dialog(Viewer& viewer, int index) {
+    const IirOverlay& overlay = viewer.iir[index];
+    std::snprintf(viewer.iir_dialog.order, sizeof(viewer.iir_dialog.order), "%d", overlay.order);
+    format_iir_number(viewer.iir_dialog.cutoff, sizeof(viewer.iir_dialog.cutoff), overlay.cutoff);
+    format_iir_number(viewer.iir_dialog.center, sizeof(viewer.iir_dialog.center), overlay.center);
+    format_iir_number(viewer.iir_dialog.width, sizeof(viewer.iir_dialog.width), overlay.width);
+    format_iir_number(viewer.iir_dialog.q, sizeof(viewer.iir_dialog.q), overlay.q);
+    format_iir_number(viewer.iir_dialog.ripple, sizeof(viewer.iir_dialog.ripple), overlay.ripple);
+    viewer.iir_dialog.index = index;
+    viewer.iir_dialog.invalid = false;
+    viewer.iir_dialog.request_open = true;
+}
+
+bool accept_iir_dialog(Viewer& viewer) {
+    const int index = viewer.iir_dialog.index;
+    if (index < 0 || index >= kIirCount) {
+        return false;
+    }
+    const IirSpec& spec = kIirSpecs[index];
+    IirOverlay& overlay = viewer.iir[index];
+    IirSettings settings;
+    settings.family = spec.family;
+    settings.response = spec.response;
+    settings.order = overlay.order;
+    settings.cutoff = overlay.cutoff;
+    settings.center = overlay.center;
+    settings.width = overlay.width;
+    settings.q = overlay.q;
+    settings.ripple = overlay.ripple;
+
+    const bool band = iir_response_is_band(spec.response);
+    const bool rbj = spec.family == IirFamily::Rbj;
+    const bool chebyshev = spec.family == IirFamily::ChebyshevI || spec.family == IirFamily::ChebyshevII;
+    if (!rbj) {
+        const std::optional<int> order = parse_frame_text(viewer.iir_dialog.order);
+        if (!order.has_value()) {
+            return false;
+        }
+        settings.order = *order;
+    }
+    if (!band) {
+        const std::optional<double> cutoff = parse_iir_number(viewer.iir_dialog.cutoff);
+        if (!cutoff.has_value()) {
+            return false;
+        }
+        settings.cutoff = *cutoff;
+    } else {
+        const std::optional<double> center = parse_iir_number(viewer.iir_dialog.center);
+        const std::optional<double> width = parse_iir_number(viewer.iir_dialog.width);
+        if (!center.has_value() || !width.has_value()) {
+            return false;
+        }
+        settings.center = *center;
+        settings.width = *width;
+    }
+    if (rbj && !band) {
+        const std::optional<double> q = parse_iir_number(viewer.iir_dialog.q);
+        if (!q.has_value()) {
+            return false;
+        }
+        settings.q = *q;
+    }
+    if (chebyshev) {
+        const std::optional<double> ripple = parse_iir_number(viewer.iir_dialog.ripple);
+        if (!ripple.has_value()) {
+            return false;
+        }
+        settings.ripple = *ripple;
+    }
+
+    TDMS::object* object = plotted_object(viewer);
+    if (object == nullptr) {
+        return false;
+    }
+    const std::optional<double> increment = waveform_increment(*object);
+    if (!increment.has_value() || !iir_design_ok(settings, 1.0 / *increment)) {
+        return false;
+    }
+
+    overlay.order = settings.order;
+    overlay.cutoff = settings.cutoff;
+    overlay.center = settings.center;
+    overlay.width = settings.width;
+    overlay.q = settings.q;
+    overlay.ripple = settings.ripple;
+    overlay.on = true;
+    return true;
+}
+
+void draw_iir_dialog(Viewer& viewer) {
+    if (viewer.iir_dialog.index < 0 || viewer.iir_dialog.index >= kIirCount) {
+        return;
+    }
+    const IirSpec& spec = kIirSpecs[viewer.iir_dialog.index];
+    if (viewer.iir_dialog.request_open) {
+        ImGui::OpenPopup(spec.title);
+        viewer.iir_dialog.request_open = false;
+    }
+    if (!ImGui::BeginPopupModal(spec.title, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    const bool band = iir_response_is_band(spec.response);
+    const bool rbj = spec.family == IirFamily::Rbj;
+    const bool chebyshev = spec.family == IirFamily::ChebyshevI || spec.family == IirFamily::ChebyshevII;
+    if (!rbj) {
+        ImGui::InputText("Order", viewer.iir_dialog.order, sizeof(viewer.iir_dialog.order));
+    }
+    if (!band) {
+        ImGui::InputText("Cutoff (Hz)", viewer.iir_dialog.cutoff, sizeof(viewer.iir_dialog.cutoff));
+    } else {
+        ImGui::InputText("Center (Hz)", viewer.iir_dialog.center, sizeof(viewer.iir_dialog.center));
+        ImGui::InputText("Width (Hz)", viewer.iir_dialog.width, sizeof(viewer.iir_dialog.width));
+    }
+    if (rbj && !band) {
+        ImGui::InputText("Q", viewer.iir_dialog.q, sizeof(viewer.iir_dialog.q));
+    }
+    if (chebyshev) {
+        const char* label =
+            spec.family == IirFamily::ChebyshevI ? "Passband ripple (dB)" : "Stopband ripple (dB)";
+        ImGui::InputText(label, viewer.iir_dialog.ripple, sizeof(viewer.iir_dialog.ripple));
+    }
+    if (viewer.iir_dialog.invalid) {
+        ImGui::TextWrapped("%s", spec.error);
+    }
+    if (ImGui::Button("OK")) {
+        if (accept_iir_dialog(viewer)) {
+            viewer.iir_dialog.invalid = false;
+            ImGui::CloseCurrentPopup();
+        } else {
+            viewer.iir_dialog.invalid = true;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) {
+        viewer.iir[viewer.iir_dialog.index].on = false;
+        viewer.iir_dialog.invalid = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+bool iir_cache_matches(const IirOverlay& overlay, const std::string& path, std::size_t count, double dt) {
+    return overlay.cache_set && overlay.cache_path == path && overlay.cache_count == count && overlay.cache_dt == dt &&
+           overlay.cache_order == overlay.order && overlay.cache_cutoff == overlay.cutoff &&
+           overlay.cache_center == overlay.center && overlay.cache_width == overlay.width &&
+           overlay.cache_q == overlay.q && overlay.cache_ripple == overlay.ripple;
+}
+
+const double* iir_channel_samples(
+    TDMS::object& object, SampleKind kind, Viewer& viewer, std::vector<double>& copied) {
+    const std::size_t count = object.number_values();
+    const void* data = object.data();
+    if (data == nullptr) {
+        return nullptr;
+    }
+    if (kind == SampleKind::Float) {
+        const auto* samples = static_cast<const float*>(data);
+        copied.resize(count);
+        for (std::size_t index = 0; index < count; ++index) {
+            copied[index] = static_cast<double>(samples[index]);
+        }
+        return copied.data();
+    }
+    if (kind == SampleKind::Double) {
+        return static_cast<const double*>(data);
+    }
+    if (!is_integer_kind(kind)) {
+        return nullptr;
+    }
+    fill_integer_samples(object, kind, viewer.integer_samples);
+    if (viewer.integer_samples.values.size() != count) {
+        return nullptr;
+    }
+    return viewer.integer_samples.values.data();
+}
+
+void plot_iir_overlays(TDMS::object& object, SampleKind kind, Viewer& viewer) {
+    const std::optional<double> increment = waveform_increment(object);
+    if (!increment.has_value()) {
+        return;
+    }
+    if (is_integer_kind(kind)) {
+        fill_integer_samples(object, kind, viewer.integer_samples);
+        if (viewer.integer_samples.values.size() != object.number_values()) {
+            return;
+        }
+    }
+    const double dt = *increment;
+    const std::string path = object.get_path();
+    const std::size_t count = object.number_values();
+    if (count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return;
+    }
+    const int plot_count = static_cast<int>(count);
+    const double* samples = nullptr;
+    std::vector<double> copied;
+    bool samples_loaded = false;
+    for (int index = 0; index < kIirCount; ++index) {
+        IirOverlay& overlay = viewer.iir[index];
+        if (!overlay.on) {
+            continue;
+        }
+        if (!iir_cache_matches(overlay, path, count, dt)) {
+            if (!samples_loaded) {
+                samples = iir_channel_samples(object, kind, viewer, copied);
+                samples_loaded = true;
+            }
+            if (samples == nullptr && plot_count != 0) {
+                continue;
+            }
+            IirSettings settings;
+            settings.family = kIirSpecs[index].family;
+            settings.response = kIirSpecs[index].response;
+            settings.order = overlay.order;
+            settings.cutoff = overlay.cutoff;
+            settings.center = overlay.center;
+            settings.width = overlay.width;
+            settings.q = overlay.q;
+            settings.ripple = overlay.ripple;
+            std::vector<double> filtered;
+            const bool filtered_ok = filter_channel(samples, plot_count, 1.0 / dt, settings, filtered);
+            overlay.cache_path = path;
+            overlay.cache_count = count;
+            overlay.cache_dt = dt;
+            overlay.cache_order = overlay.order;
+            overlay.cache_cutoff = overlay.cutoff;
+            overlay.cache_center = overlay.center;
+            overlay.cache_width = overlay.width;
+            overlay.cache_q = overlay.q;
+            overlay.cache_ripple = overlay.ripple;
+            overlay.cache_set = true;
+            if (!filtered_ok || filtered.size() != count) {
+                overlay.values.clear();
+                overlay.cache_failed = true;
+                continue;
+            }
+            overlay.values = std::move(filtered);
+            overlay.cache_failed = false;
+        }
+        if (overlay.cache_failed || overlay.values.size() != count || plot_count == 0) {
+            continue;
+        }
+        ImPlot::PlotLine(kIirSpecs[index].title, overlay.values.data(), plot_count);
+    }
+}
+
 void draw_plot(TDMS::object& object, Viewer& viewer) {
     const std::string path = object.get_path();
     const std::string type_name = object.data_type();
@@ -878,6 +1356,7 @@ void draw_plot(TDMS::object& object, Viewer& viewer) {
             plot_avg_abs_overlay(viewer.integer_samples.values.data(), plot_count, viewer);
         }
     }
+    plot_iir_overlays(object, kind, viewer);
     handle_duration_click(object, viewer);
     draw_duration(object, viewer);
     ImPlot::EndPlot();
@@ -939,6 +1418,75 @@ void draw_detail(Viewer& viewer) {
     ImGui::EndChild();
 }
 
+std::optional<double> visible_frequency(Viewer& viewer) {
+    TDMS::object* object = plotted_object(viewer);
+    if (object == nullptr || !viewer.plot_x_known || !std::isfinite(viewer.plot_x_min) ||
+        !std::isfinite(viewer.plot_x_max)) {
+        return std::nullopt;
+    }
+    const std::optional<double> increment = waveform_increment(*object);
+    if (!increment.has_value()) {
+        return std::nullopt;
+    }
+    const int count = static_cast<int>(object->number_values());
+    int first = 0;
+    int last = 0;
+    if (!view_sample_bounds(viewer.plot_x_min, viewer.plot_x_max, count, first, last)) {
+        return std::nullopt;
+    }
+    const int window = last - first + 1;
+    const SampleKind kind = sample_kind(object->data_type());
+    const double* samples = nullptr;
+    std::vector<double> copied;
+    if (kind == SampleKind::Float) {
+        const auto* data = static_cast<const float*>(object->data());
+        copied.resize(static_cast<std::size_t>(window));
+        for (int index = 0; index < window; ++index) {
+            copied[static_cast<std::size_t>(index)] =
+                static_cast<double>(data[first + index]);
+        }
+        samples = copied.data();
+    } else if (kind == SampleKind::Double) {
+        samples = static_cast<const double*>(object->data()) + first;
+    } else if (is_integer_kind(kind)) {
+        fill_integer_samples(*object, kind, viewer.integer_samples);
+        if (viewer.integer_samples.values.size() != object->number_values()) {
+            return std::nullopt;
+        }
+        samples = viewer.integer_samples.values.data() + static_cast<std::size_t>(first);
+    } else {
+        return std::nullopt;
+    }
+    return least_squares_frequency(samples, window, *increment);
+}
+
+void open_frequency(Viewer& viewer) {
+    const std::optional<double> hertz = visible_frequency(viewer);
+    viewer.frequency_dialog.fit = hertz.has_value();
+    viewer.frequency_dialog.hertz = hertz.value_or(0.0);
+    viewer.frequency_dialog.request_open = true;
+}
+
+void draw_frequency_dialog(Viewer& viewer) {
+    if (viewer.frequency_dialog.request_open) {
+        ImGui::OpenPopup("Frequency");
+        viewer.frequency_dialog.request_open = false;
+    }
+    if (!ImGui::BeginPopupModal("Frequency", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    if (viewer.frequency_dialog.fit) {
+        const std::string label = format_frequency(viewer.frequency_dialog.hertz);
+        ImGui::TextUnformatted(label.c_str());
+    } else {
+        ImGui::TextUnformatted("The visible samples cannot be fit.");
+    }
+    if (ImGui::Button("Close")) {
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 void export_current_range(Viewer& viewer, TDMS::object& object, const std::string& path, bool csv) {
     try {
         if (csv) {
@@ -949,6 +1497,100 @@ void export_current_range(Viewer& viewer, TDMS::object& object, const std::strin
         viewer.error.clear();
     } catch (const std::exception& ex) {
         viewer.error = ex.what();
+    }
+}
+
+void draw_fft_window(Viewer& viewer) {
+    if (!viewer.fft_on) {
+        return;
+    }
+    bool open = true;
+    if (!ImGui::Begin("FFT###histogram", &open, ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::End();
+        if (!open) {
+            viewer.fft_on = false;
+        }
+        return;
+    }
+
+    std::vector<double> xs;
+    std::vector<double> ys;
+    bool hertz = false;
+    double width = 0.8;
+    bool bounds_known = false;
+    std::string path;
+    int first = 0;
+    int last = 0;
+
+    TDMS::object* object = plotted_object(viewer);
+    if (object == nullptr) {
+        viewer.fft_hist_known = false;
+    } else if (viewer.plot_x_known && std::isfinite(viewer.plot_x_min) && std::isfinite(viewer.plot_x_max) &&
+               viewer.fft_count >= 1) {
+        const int count = static_cast<int>(object->number_values());
+        if (view_sample_bounds(viewer.plot_x_min, viewer.plot_x_max, count, first, last)) {
+            const int window = last - first + 1;
+            const SampleKind kind = sample_kind(object->data_type());
+            std::vector<double> copied;
+            const double* samples = nullptr;
+            if (kind == SampleKind::Float) {
+                const auto* data = static_cast<const float*>(object->data());
+                copied.resize(static_cast<std::size_t>(window));
+                for (int index = 0; index < window; ++index) {
+                    copied[static_cast<std::size_t>(index)] =
+                        static_cast<double>(data[first + index]);
+                }
+                samples = copied.data();
+            } else if (kind == SampleKind::Double) {
+                samples = static_cast<const double*>(object->data()) + first;
+            } else if (is_integer_kind(kind)) {
+                fill_integer_samples(*object, kind, viewer.integer_samples);
+                if (viewer.integer_samples.values.size() == object->number_values()) {
+                    samples = viewer.integer_samples.values.data() + static_cast<std::size_t>(first);
+                }
+            }
+            if (samples != nullptr) {
+                path = object->get_path();
+                bounds_known = true;
+                const std::optional<double> increment = waveform_increment(*object);
+                hertz = increment.has_value();
+                const double bin_step =
+                    hertz ? 1.0 / (static_cast<double>(window) * *increment) : 1.0;
+                width = 0.8 * bin_step;
+                const std::vector<FftComponent> components =
+                    separate_components(samples, window, viewer.fft_count);
+                xs.resize(components.size());
+                ys.resize(components.size());
+                for (std::size_t index = 0; index < components.size(); ++index) {
+                    xs[index] = static_cast<double>(components[index].bin) * bin_step;
+                    ys[index] = components[index].amplitude;
+                }
+            }
+        }
+    }
+
+    const bool changed = bounds_known &&
+        (!viewer.fft_hist_known || viewer.fft_hist_path != path || viewer.fft_hist_first != first ||
+         viewer.fft_hist_last != last);
+    if (!xs.empty() && changed) {
+        ImPlot::SetNextAxesToFit();
+    }
+    if (ImPlot::BeginPlot("##fft_histogram", ImVec2(-1.0f, -1.0f))) {
+        ImPlot::SetupAxis(ImAxis_X1, hertz ? "Hz" : "");
+        if (!xs.empty()) {
+            ImPlot::PlotBars("FFT", xs.data(), ys.data(), static_cast<int>(xs.size()), width);
+        }
+        ImPlot::EndPlot();
+        if (bounds_known) {
+            viewer.fft_hist_known = true;
+            viewer.fft_hist_path = std::move(path);
+            viewer.fft_hist_first = first;
+            viewer.fft_hist_last = last;
+        }
+    }
+    ImGui::End();
+    if (!open) {
+        viewer.fft_on = false;
     }
 }
 
@@ -1003,6 +1645,24 @@ void draw_ui(Viewer& viewer, GLFWwindow* window) {
                     open_avg_abs_dialog(viewer);
                 }
             }
+            if (ImGui::MenuItem("FFT", nullptr, viewer.fft_on, plotted_channel)) {
+                if (viewer.fft_on) {
+                    viewer.fft_on = false;
+                } else {
+                    open_fft_dialog(viewer);
+                }
+            }
+            const bool iir_channel = plotted_channel && waveform_increment(*plotted).has_value();
+            for (int index = 0; index < kIirCount; ++index) {
+                if (ImGui::MenuItem(
+                        kIirSpecs[index].title, nullptr, viewer.iir[index].on, iir_channel || viewer.iir[index].on)) {
+                    if (viewer.iir[index].on) {
+                        viewer.iir[index].on = false;
+                    } else {
+                        open_iir_dialog(viewer, index);
+                    }
+                }
+            }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Tools")) {
@@ -1011,11 +1671,17 @@ void draw_ui(Viewer& viewer, GLFWwindow* window) {
                 viewer.duration_on = !viewer.duration_on;
                 clear_duration_markers(viewer);
             }
+            if (ImGui::MenuItem("Frequency", nullptr, false, can_measure)) {
+                open_frequency(viewer);
+            }
             ImGui::EndMenu();
         }
         draw_set_frame_dialog(viewer);
         draw_rms_dialog(viewer);
         draw_avg_abs_dialog(viewer);
+        draw_fft_dialog(viewer);
+        draw_iir_dialog(viewer);
+        draw_frequency_dialog(viewer);
         ImGui::EndMainMenuBar();
     }
 
@@ -1030,6 +1696,7 @@ void draw_ui(Viewer& viewer, GLFWwindow* window) {
     ImGui::SameLine();
     draw_detail(viewer);
     ImGui::End();
+    draw_fft_window(viewer);
 }
 
 void glfw_error_callback(int error, const char* description) {
